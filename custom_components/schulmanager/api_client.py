@@ -528,18 +528,27 @@ class SchulmanagerClient:
     def _convert_calendar_event_to_exam(event: dict[str, Any]) -> dict[str, Any] | None:
         """Convert a school-wide calendar event (real UTC timestamps) into exam-shaped data.
 
-        The calendar/events endpoint returns genuinely timezone-aware UTC
-        timestamps (e.g. "2026-08-28T11:30:00.000Z"), unlike every other
-        schedule/exam time in this API which is already naive local wall-clock
-        time. Converting to local *before* deriving the date/time strings is
-        required - otherwise the raw UTC digits get treated as local further
-        downstream (calendar.py's `as_local()` only tags naive datetimes as
-        local, it does not convert them), producing a 1-2h display offset.
+        The calendar/events endpoint returns genuinely UTC timestamps (e.g.
+        "2026-08-28T11:30:00.000Z"), unlike every other schedule/exam time in
+        this API which is already naive local wall-clock time. Some
+        Schulmanager instances omit the "Z"/offset suffix, so
+        `dt_util.parse_datetime()` returns a naive datetime even though the
+        value is still UTC; assume UTC explicitly for a naive result instead
+        of relying on the string carrying a timezone marker. Converting to
+        local *before* deriving the date/time strings is required - otherwise
+        the raw UTC digits get treated as local further downstream
+        (calendar.py's `as_local()` only tags naive datetimes as local, it
+        does not convert them), producing a 1-2h display offset.
         """
         start_dt = dt_util.parse_datetime(event.get("start", ""))
         end_dt = dt_util.parse_datetime(event.get("end", ""))
         if start_dt is None:
             return None
+
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=dt_util.UTC)
+        if end_dt is not None and end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=dt_util.UTC)
 
         start_dt = dt_util.as_local(start_dt)
         if end_dt is not None:

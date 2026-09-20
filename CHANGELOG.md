@@ -1,5 +1,15 @@
 # Schulmanager Integration – Changelog
 
+## 0.10.1 (2026-09-20)
+
+### 🐛 Bugfixes
+
+- **Schulweite Termine bis zu 2 Stunden zu früh im Kalender (Issue #11)**
+  - Problem: Bei manchen Schulmanager-Konten wurden Uhrzeiten von schulweiten Terminen (z.B. Elternabende, Veranstaltungen) im Kalender bis zu 2 Stunden zu früh angezeigt
+  - Lösung: Die Zeitzonen-Behandlung für diese Termine wurde robuster gemacht – betrifft nur Termine, keine regulären Unterrichtsstunden
+
+---
+
 ## 0.10.0 (2026-09-20)
 
 ### ✨ Neues
