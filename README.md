@@ -9,7 +9,7 @@ Bringt Stundenplan, Arbeiten, Hausaufgaben und Noten aus Schulmanager Online dir
 
 - **📅 Kalender pro Schüler** – Stundenplan, Arbeiten/Klausuren und Schultermine (z.B. Schulball, BLF)
 - **📝 Hausaufgaben** – Als To‑Do‑Listen mit Status-Verwaltung
-- **🧮 Noten** – Pro Fach und Gesamtdurchschnitt mit detaillierten Zusammenfassungen
+- **🧮 Noten** – Pro Fach und Gesamtdurchschnitt mit detaillierten Zusammenfassungen, inkl. Punktesystem der gymnasialen Oberstufe (Sek II, 0–15 Punkte)
 - **🔔 Ereignisse** – Bei neuen Hausaufgaben oder Noten
 - **🏫 Multi-School Support** – Automatische Verwaltung bei Kindern an mehreren Schulen
 
@@ -61,6 +61,8 @@ Bringt Stundenplan, Arbeiten, Hausaufgaben und Noten aus Schulmanager Online dir
 | Parameter | Standard | Beschreibung |
 |-----------|----------|--------------|
 | **Manuelle Aktualisierung Cooldown** | 5 Min | Wartezeit zwischen manuellen Updates (5-30 Min) |
+| **Tage in der Vergangenheit** | 30 | Zeitraum für rückwirkend abgerufene Daten (z.B. Arbeiten/Schultermine) |
+| **Tage in der Zukunft** | 180 | Zeitraum für im Voraus abgerufene Daten (z.B. Arbeiten/Schultermine) |
 
 ### Erweiterte Einstellungen
 | Parameter | Standard | Beschreibung |
@@ -151,6 +153,20 @@ Löst eine manuelle Aktualisierung aus (respektiert Cooldown).
 service: schulmanager.refresh
 ```
 
+### `schulmanager.clear_cache`
+Löscht Sitzungsdaten/Cache der Integration (z.B. bei Login-Problemen).
+
+```yaml
+service: schulmanager.clear_cache
+```
+
+### `schulmanager.clear_debug`
+Löscht alle Debug-Dateien im Integrationsordner.
+
+```yaml
+service: schulmanager.clear_debug
+```
+
 ## 📝 Beispiel Lovelace-Karte
 
 ```yaml
@@ -184,6 +200,12 @@ A: ❌ = Entfall, 🔁 = Vertretung/Sonderstunde/Lehrerwechsel, 🚪 = Raumwechs
 **Q: Wie oft aktualisiert die Integration?**
 A: Automatisch alle 5 Minuten. Manuelle Updates sind mit einstellbarem Cooldown (Standard: 5 Min) möglich.
 
+**Q: Werden Noten im Punktesystem der gymnasialen Oberstufe (Sek II) unterstützt?**
+A: Ja, ab v0.10.0. Kurse mit dem 0–15-Punkte-System werden automatisch erkannt und korrekt dargestellt – keine Konfiguration nötig. Der Gesamtdurchschnitt berücksichtigt weiterhin nur Fächer mit klassischer 1–6-Notenskala, da beide Systeme nicht sinnvoll gemischt werden können.
+
+**Q: Was passiert, wenn sich mein Schulmanager-Passwort ändert?**
+A: Home Assistant zeigt automatisch eine Reauth-Benachrichtigung an, über die du die neuen Zugangsdaten eingeben kannst, ohne die Integration neu einzurichten.
+
 ## 🐛 Fehlersuche
 
 ### Debug-Dumps aktivieren
@@ -193,6 +215,9 @@ A: Automatisch alle 5 Minuten. Manuelle Updates sind mit einstellbarem Cooldown 
 
 ### Logs prüfen
 Einstellungen → System → Logs → Nach "schulmanager" filtern
+
+### Diagnose-Download
+Einstellungen → Geräte & Dienste → Schulmanager → Integration → Diagnose herunterladen liefert einen anonymisierten Datenexport für Fehlerberichte.
 
 ## 🤝 Beitragen
 
