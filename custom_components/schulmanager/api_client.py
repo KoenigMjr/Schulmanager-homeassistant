@@ -539,6 +539,14 @@ class SchulmanagerClient:
         the raw UTC digits get treated as local further downstream
         (calendar.py's `as_local()` only tags naive datetimes as local, it
         does not convert them), producing a 1-2h display offset.
+
+        `allDay` events are exempt from this: their midnight timestamp is a
+        calendar-date marker, not a real moment in time, so UTC-converting it
+        can push it onto the wrong side of midnight and/or attach a spurious
+        time-of-day (e.g. 02:00) to what should render as a full-day entry.
+        For those, no `startClassHour` is emitted at all - calendar.py's
+        `_exam_times()` already falls back to a full local day when the key
+        is absent, which is exactly the desired all-day rendering.
         """
         start_dt = dt_util.parse_datetime(event.get("start", ""))
         end_dt = dt_util.parse_datetime(event.get("end", ""))
@@ -554,10 +562,7 @@ class SchulmanagerClient:
         if end_dt is not None:
             end_dt = dt_util.as_local(end_dt)
 
-        start_time = start_dt.strftime("%H:%M:%S")
-        end_time = end_dt.strftime("%H:%M:%S") if end_dt is not None else start_time
-
-        return {
+        result: dict[str, Any] = {
             "id": event.get("id"),
             "date": start_dt.date().isoformat(),
             "subject": {
@@ -571,12 +576,18 @@ class SchulmanagerClient:
                 "color": "#ff0000",
                 "visibleForStudents": True,
             },
-            "startClassHour": {"from": start_time, "until": end_time, "number": "X"},
-            "endClassHour": {"from": end_time, "until": end_time, "number": "X"},
             "createdAt": event.get("createdAt"),
             "updatedAt": event.get("updatedAt"),
             "_isCalendarEvent": True,  # Flag to identify source
         }
+
+        if not event.get("allDay"):
+            start_time = start_dt.strftime("%H:%M:%S")
+            end_time = end_dt.strftime("%H:%M:%S") if end_dt is not None else start_time
+            result["startClassHour"] = {"from": start_time, "until": end_time, "number": "X"}
+            result["endClassHour"] = {"from": end_time, "until": end_time, "number": "X"}
+
+        return result
 
     async def fetch_exams(
         self, student_id: str, class_id: int | None = None, date_range_config: dict[str, int] | None = None
@@ -1695,18 +1706,30 @@ class SchulmanagerClient:
             if avg is not None:
                 all_subject_averages.append(avg)
 
-        # Calculate overall student average. Only classic-scale (1-6) subjects
-        # are blended into this single figure - averaging a 0-15 points-scale
-        # subject together with a 1-6 subject would be numerically meaningless.
-        classic_averages = [
-            subject_data["average"]
-            for subject_data in subjects.values()
-            if subject_data["average"] is not None
-            and subject_data["grading_system"] == grading.GRADING_SYSTEM_CLASSIC
-        ]
+        # Calculate overall student average, blending only subjects that share
+        # a grading system - averaging a 0-15 points-scale subject together
+        # with a 1-6 subject would be numerically meaningless. A student uses
+        # a single grading system in practice (Sek I: classic, Sek II: points),
+        # so group by system and use whichever group has graded subjects.
+        averages_by_system: dict[int, list[float]] = {}
+        for subject_data in subjects.values():
+            if subject_data["average"] is not None:
+                averages_by_system.setdefault(subject_data["grading_system"], []).append(
+                    subject_data["average"]
+                )
+
         overall_average = None
-        if classic_averages:
-            overall_average = round(sum(classic_averages) / len(classic_averages), 1)
+        if averages_by_system:
+            # Ties (e.g. exactly one graded subject on each scale) favor the
+            # classic scale, since it is the far more common case.
+            dominant_averages = max(
+                averages_by_system.items(),
+                key=lambda system_averages: (
+                    len(system_averages[1]),
+                    system_averages[0] == grading.GRADING_SYSTEM_CLASSIC,
+                ),
+            )[1]
+            overall_average = round(sum(dominant_averages) / len(dominant_averages), 1)
 
         return cast(
             GradesPayload,

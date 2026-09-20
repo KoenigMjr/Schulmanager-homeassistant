@@ -1,5 +1,19 @@
 # Schulmanager Integration – Changelog
 
+## 0.10.2 (2026-09-20)
+
+### 🐛 Bugfixes
+
+- **Ganztägige Schultermine zeigten 02:00 Uhr statt "ganztägig" (Folgefehler von v0.10.1)**
+  - Problem: Nach dem Zeitzonen-Fix in v0.10.1 wurden ganztägige Termine (z.B. bewegliche Ferientage, mehrtägige Events) im Kalender mit einer Uhrzeit wie "02:00" statt als ganztägiger Eintrag angezeigt
+  - Lösung: Ganztägige Termine werden jetzt korrekt erkannt und wieder ohne Uhrzeit dargestellt – normale Termine mit Uhrzeit sind vom v0.10.1-Fix weiterhin unberührt
+
+- **Kein Gesamtdurchschnitt für Schüler:innen im Punktesystem der gymnasialen Oberstufe**
+  - Problem: Schüler:innen, die ausschließlich im 0–15-Punktesystem benotet werden, hatten nie einen Gesamtdurchschnitt – das Feld blieb leer
+  - Lösung: Der Gesamtdurchschnitt wird jetzt auch für das Punktesystem korrekt berechnet
+
+---
+
 ## 0.10.1 (2026-09-20)
 
 ### 🐛 Bugfixes
