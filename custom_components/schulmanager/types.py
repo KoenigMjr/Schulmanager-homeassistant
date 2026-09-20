@@ -50,7 +50,15 @@ class GradeEntry(TypedDict, total=False):
     duration: int | None
     type_abbreviation: str | None
     is_repeat_exam: bool | None
-    numeric_value: float | None
+    numeric_value: float | int | None
+    # Absent is treated as True by all consumers (backward-compatible with
+    # entries created before these fields existed).
+    fires_event: bool
+    counts_toward_average: bool
+    # Used by grading.calculate_average's two-level weighting; absent means
+    # "no known block" (falls back to an unweighted 1.0 block share).
+    grading_block_id: int | None
+    block_weighting: float
 
 
 class SubjectGrades(TypedDict):
@@ -60,6 +68,7 @@ class SubjectGrades(TypedDict):
     abbreviation: str
     average: float | None
     grades: dict[str, list[GradeEntry]]
+    grading_system: int
 
 
 class GradesPayload(TypedDict):

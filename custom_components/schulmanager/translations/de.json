@@ -26,6 +26,9 @@
       },
       "wochenplan_json": {
         "name": "Wochenplan JSON"
+      },
+      "school": {
+        "name": "Schule"
       }
     },
     "todo": {

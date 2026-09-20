@@ -8,21 +8,22 @@ use stable, ID-based unique IDs.
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
-import logging
 from html import escape
+import logging
 from typing import Any, cast
 
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.entity import EntityCategory
-from homeassistant.helpers.typing import StateType
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.typing import StateType
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
+from . import grading
 from .const import DOMAIN, OPT_SCHEDULE_HIGHLIGHT
 from .coordinator import SchulmanagerCoordinator
 from .types import IntegrationData
@@ -142,8 +143,11 @@ class ScheduleSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEntity):
         self.student_id = student_id
         self.student_name = student_name
         self.day = day
-        # Stable unique ID based on immutable student ID
-        self._attr_unique_id = f"schulmanager_{self.student_id}_schedule_{day}"
+        # Stable unique ID, scoped to this config entry so the same student
+        # appearing in another entry (e.g. their own login alongside a
+        # parent's account) does not collide with it.
+        entry_id = self.coordinator.config_entry.entry_id
+        self._attr_unique_id = f"schulmanager_{entry_id}_{self.student_id}_schedule_{day}"
         # Use translations for entity name
         self._attr_translation_key = (
             "schedule_today" if day == "today" else "schedule_tomorrow"
@@ -510,6 +514,7 @@ class ScheduleSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEntity):
                     "room": "",
                     "info": info_text,
                     "highlight": True,
+                    "lesson_type": "cancelledLesson",
                 }
                 block["has_change"] = True
                 block["primary"] = primary
@@ -519,7 +524,8 @@ class ScheduleSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEntity):
                     or primary.get("lesson_type") != "regularLesson"
                 )
                 primary["highlight"] = bool(highlight)
-                primary.pop("lesson_type", None)
+                # lesson_type is kept (not popped) - _generate_plain_text needs it
+                # for emoji selection and it's otherwise unused by the html rows.
             if secondary is None:
                 secondary = {"subject": "", "room": "", "info": "", "strike": False}
                 block["secondary"] = secondary
@@ -531,22 +537,22 @@ class ScheduleSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEntity):
             row_attr = HIGHLIGHT_ROW_ATTR if primary.get("highlight") else ""
             hour_cell = f'<td rowspan="2" valign="top">{hour_markup}</td>'
             rows.append(
-                (
+
                     f"<tr{row_attr}>{hour_cell}"
                     f"{_format_cell(primary.get('subject', ''))}"
                     f"{_format_cell(primary.get('room', ''))}"
                     f"{_format_cell(primary.get('info', ''))}"
                     "</tr>"
-                )
+
             )
             rows.append(
-                (
+
                     f"<tr{row_attr}>"
                     f"{_format_cell(secondary.get('subject', ''), strike=secondary.get('strike', False))}"
                     f"{_format_cell(secondary.get('room', ''), strike=secondary.get('strike', False))}"
                     f"{_format_cell(secondary.get('info', ''), strike=secondary.get('strike', False))}"
                     "</tr>"
-                )
+
             )
 
         if not rows:
@@ -562,8 +568,11 @@ class ScheduleSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEntity):
                 "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
             )
 
-        # Generate plain text format for notifications (with emoji highlighting)
-        plain_text = self._generate_plain_text(items_sorted)
+        # Generate plain text format for notifications (with emoji highlighting).
+        # Reuses the already per-hour-merged `blocks` (not the raw lesson list)
+        # so a cancelled lesson with a same-hour substitution produces exactly
+        # one line, matching the html attribute instead of showing both.
+        plain_text = self._generate_plain_text(blocks)
 
         return {
             "raw": raw_data,
@@ -586,13 +595,19 @@ class ScheduleSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEntity):
             return now + timedelta(days=1)
         return now
 
-    def _generate_plain_text(self, lessons: list[dict[str, Any]]) -> str:
+    def _generate_plain_text(self, blocks: list[dict[str, Any]]) -> str:
         """Generate plain text schedule with emoji highlighting for notifications.
 
         Format: "1. Std: 🔁 Mathematik – Raum 204 (Vertretung)"
         Uses same emoji logic as calendar.
+
+        Consumes the same per-hour-merged `blocks` structure the html
+        attribute is built from (one entry per hour, cancellation already
+        suppressed when a same-hour substitution exists), so a cancelled
+        lesson with a substitution produces exactly one line here too,
+        instead of one line per raw lesson.
         """
-        if not lessons:
+        if not blocks:
             if self._is_weekend_day():
                 return "Wochenende - keine Schule"
             return "Schulfrei"
@@ -605,36 +620,12 @@ class ScheduleSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEntity):
 
         lines: list[str] = []
 
-        for lesson in lessons:
-            lesson_type = lesson.get("type", "regularLesson")
-            actual = lesson.get("actualLesson", {}) or {}
-
-            # Get hour number
-            hour_str = ""
-            class_hour = lesson.get("classHour", {})
-            hour_num = class_hour.get("number")
-            if isinstance(hour_num, int):
-                hour_str = f"{hour_num}. Std"
-            elif isinstance(hour_num, str) and hour_num.strip():
-                hour_str = f"{hour_num}. Std"
-
-            # Get subject
-            subject = ""
-            if actual.get("subject"):
-                subj_data = actual["subject"]
-                subject = subj_data.get("abbreviation") or subj_data.get("name") or ""
-            if not subject and lesson.get("subject"):
-                subj_data = lesson["subject"]
-                subject = subj_data.get("abbreviation") or subj_data.get("name") or ""
-            if not subject:
-                subject = "Unterricht"
-
-            # Get room
-            room = ""
-            if actual.get("room"):
-                room = actual["room"].get("name", "")
-            elif lesson.get("room"):
-                room = lesson["room"].get("name", "")
+        for block in blocks:
+            primary = block.get("primary") or {}
+            lesson_type = primary.get("lesson_type", "regularLesson")
+            hour_str = block.get("hour_display") or ""
+            subject = primary.get("subject") or "Unterricht"
+            room = primary.get("room") or ""
 
             # Emoji highlighting (same logic as calendar.py)
             emoji = ""
@@ -660,28 +651,14 @@ class ScheduleSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEntity):
                 subject_part += f" – {room}"
             line_parts.append(subject_part)
 
-            # Additional info (teacher, reason)
+            # Additional info (teacher/reason, already combined by the html
+            # path's _build_info_text), falling back to a type label
             info_parts: list[str] = []
-
-            # Teacher
-            teachers = actual.get("teachers") or lesson.get("teachers") or []
-            if teachers:
-                teacher_abbr = ", ".join(
-                    t.get("abbreviation") or f"{t.get('firstname', '')} {t.get('lastname', '')}".strip()
-                    for t in teachers if isinstance(t, dict)
-                )
-                if teacher_abbr:
-                    info_parts.append(teacher_abbr)
-
-            # Change reason
-            reason = lesson.get("substitutionText") or lesson.get("comment") or ""
-            if reason:
-                info_parts.append(reason)
-
-            # Type label for non-regular lessons (if no other info)
-            if not info_parts and lesson_type != "regularLesson":
-                type_label = LESSON_TYPE_LABELS.get(lesson_type, lesson_type)
-                info_parts.append(type_label)
+            info_text = primary.get("info") or ""
+            if info_text:
+                info_parts.append(info_text)
+            elif lesson_type not in ("regularLesson", "cancelledLesson"):
+                info_parts.append(LESSON_TYPE_LABELS.get(lesson_type, lesson_type))
 
             # Assemble line
             if line_parts:
@@ -711,8 +688,10 @@ class ScheduleChangesSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEn
         self.client = client
         self.student_id = student_id
         self.student_name = student_name
-        # Stable unique ID based on immutable student ID
-        self._attr_unique_id = f"schulmanager_{self.student_id}_schedule_changes"
+        # Stable unique ID, scoped to this config entry so the same student
+        # appearing in another entry does not collide with it.
+        entry_id = self.coordinator.config_entry.entry_id
+        self._attr_unique_id = f"schulmanager_{entry_id}_{self.student_id}_schedule_changes"
         self._attr_translation_key = "schedule_changes"
         self._attr_icon = "mdi:calendar-alert"
 
@@ -821,7 +800,7 @@ class GradeSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEntity):
 
     _attr_has_entity_name = True
     _attr_state_class = None
-    _attr_suggested_display_precision = 2
+    _attr_suggested_display_precision = 1
 
     def __init__(
         self,
@@ -842,62 +821,16 @@ class GradeSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEntity):
         self.subject_id = subject_id
         self.subject_name = subject_name
         self.subject_abbrev = subject_abbrev
-        # Stable unique ID based on immutable student and subject IDs
+        # Stable unique ID, scoped to this config entry so the same student
+        # appearing in another entry does not collide with it.
+        entry_id = self.coordinator.config_entry.entry_id
         self._attr_unique_id = (
-            f"schulmanager_{self.student_id}_grades_{self.subject_id!s}"
+            f"schulmanager_{entry_id}_{self.student_id}_grades_{self.subject_id!s}"
         )
 
         # Keep dynamic name since it includes subject abbreviation
         self._attr_name = f"Noten {subject_abbrev}"
         self._attr_icon = "mdi:school"
-
-    def _parse_german_grade(self, grade_value: str | float) -> float | None:
-        """Parse German grade formats and return numeric value.
-
-        Handles formats like:
-        - "0~3" -> 3.0
-        - "0~3+" -> 3.0
-        - "0~2-" -> 2.0
-        - "3+" -> 3.0
-        - "2-" -> 2.0
-        - "2.5" -> 2.5
-        """
-        if not grade_value and grade_value != 0:
-            return None
-
-        # Handle direct numeric values
-        if isinstance(grade_value, (int, float)):
-            return float(grade_value)
-
-        grade_str = str(grade_value).strip()
-        if not grade_str:
-            return None
-
-        # Handle format "0~3" or "0~3+" or "0~2-" -> extract after tilde
-        if "~" in grade_str:
-            try:
-                # Split by tilde and get the part after it
-                grade_part = grade_str.split("~")[1]
-                # Remove tendency markers (+/-)
-                if grade_part.endswith(("+", "-")):
-                    grade_part = grade_part[:-1]
-                return float(grade_part)
-            except (ValueError, IndexError):
-                return None
-
-        # Handle formats like "4+", "4-", "2+" (without tilde prefix)
-        if grade_str.endswith(("+", "-")):
-            try:
-                # Treat both 4+ and 4- as 4.0 (ignore plus/minus for calculation)
-                return float(grade_str[:-1])
-            except ValueError:
-                return None
-
-        # Handle decimal grades like "2.5", "3.7"
-        try:
-            return float(grade_str)
-        except ValueError:
-            return None
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -965,6 +898,7 @@ class GradeSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEntity):
         grade_categories: dict[str, list[dict[str, Any]]] = cast(
             dict[str, list[dict[str, Any]]], subject_data.get("grades", {})
         )
+        grading_system = subject_data.get("grading_system", grading.GRADING_SYSTEM_CLASSIC)
         total_grades = 0
 
         # Count total grades and prepare category data with numeric values
@@ -977,8 +911,10 @@ class GradeSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEntity):
                 grade_value = grade.get("value", "")
 
                 # Extract numeric value using the same parsing logic as API client
-                numeric_value = self._parse_german_grade(grade_value)
-                if numeric_value is not None and 1.0 <= numeric_value <= 6.0:
+                numeric_value = grading.parse_grade_value(grade_value, grading_system)
+                if numeric_value is not None and grading.grade_value_in_range(
+                    numeric_value, grading_system
+                ):
                     grade_info["numeric_value"] = numeric_value
 
                 processed_grades.append(grade_info)
@@ -991,23 +927,26 @@ class GradeSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEntity):
                 }
                 total_grades += len(processed_grades)
 
-        # Extract numeric grade values (German grades are always numeric 1-6)
-        all_grade_values: list[float] = []
+        # Extract numeric grade values for best/worst (average comes from the
+        # already-computed subject_data["average"] instead of recomputing it)
+        all_grade_values: list[float | int] = []
         for grades_list in grade_categories.values():
             for grade in grades_list:
                 grade_value = grade.get("value", "")
-                # Use consistent grade parsing
-                numeric_grade = self._parse_german_grade(grade_value)
-                if numeric_grade is not None and 1.0 <= numeric_grade <= 6.0:
+                numeric_grade = grading.parse_grade_value(grade_value, grading_system)
+                if numeric_grade is not None and grading.grade_value_in_range(
+                    numeric_grade, grading_system
+                ):
                     all_grade_values.append(numeric_grade)
 
         # Calculate basic statistics
         statistics = {}
         if all_grade_values:
+            higher_is_better = grading.is_higher_better(grading_system)
             statistics = {
-                "average": round(sum(all_grade_values) / len(all_grade_values), 2),
-                "best_grade": min(all_grade_values),  # In German system, 1 is best
-                "worst_grade": max(all_grade_values),
+                "average": subject_data.get("average"),
+                "best_grade": max(all_grade_values) if higher_is_better else min(all_grade_values),
+                "worst_grade": min(all_grade_values) if higher_is_better else max(all_grade_values),
                 "total_numeric_grades": len(all_grade_values),
             }
 
@@ -1073,7 +1012,7 @@ class OverallGradeSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEntit
 
     _attr_has_entity_name = True
     _attr_state_class = None
-    _attr_suggested_display_precision = 2
+    _attr_suggested_display_precision = 1
 
     def __init__(
         self,
@@ -1088,60 +1027,14 @@ class OverallGradeSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEntit
         self.client = client
         self.student_id = student_id
         self.student_name = student_name
-        # Stable unique ID based on immutable student ID
-        self._attr_unique_id = f"schulmanager_{self.student_id}_grades_overall"
+        # Stable unique ID, scoped to this config entry so the same student
+        # appearing in another entry does not collide with it.
+        entry_id = self.coordinator.config_entry.entry_id
+        self._attr_unique_id = f"schulmanager_{entry_id}_{self.student_id}_grades_overall"
 
         # Use translation for entity name
         self._attr_translation_key = "grades_overall"
         self._attr_icon = "mdi:school"
-
-    def _parse_german_grade(self, grade_value: str | float) -> float | None:
-        """Parse German grade formats and return numeric value.
-
-        Handles formats like:
-        - "0~3" -> 3.0
-        - "0~3+" -> 3.0
-        - "0~2-" -> 2.0
-        - "3+" -> 3.0
-        - "2-" -> 2.0
-        - "2.5" -> 2.5
-        """
-        if not grade_value and grade_value != 0:
-            return None
-
-        # Handle direct numeric values
-        if isinstance(grade_value, (int, float)):
-            return float(grade_value)
-
-        grade_str = str(grade_value).strip()
-        if not grade_str:
-            return None
-
-        # Handle format "0~3" or "0~3+" or "0~2-" -> extract after tilde
-        if "~" in grade_str:
-            try:
-                # Split by tilde and get the part after it
-                grade_part = grade_str.split("~")[1]
-                # Remove tendency markers (+/-)
-                if grade_part.endswith(("+", "-")):
-                    grade_part = grade_part[:-1]
-                return float(grade_part)
-            except (ValueError, IndexError):
-                return None
-
-        # Handle formats like "4+", "4-", "2+" (without tilde prefix)
-        if grade_str.endswith(("+", "-")):
-            try:
-                # Treat both 4+ and 4- as 4.0 (ignore plus/minus for calculation)
-                return float(grade_str[:-1])
-            except ValueError:
-                return None
-
-        # Handle decimal grades like "2.5", "3.7"
-        try:
-            return float(grade_str)
-        except ValueError:
-            return None
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -1272,8 +1165,10 @@ class NextExamCountdownSensor(CoordinatorEntity[SchulmanagerCoordinator], Sensor
         self.client = client
         self.student_id = student_id
         self.student_name = student_name
-        # Stable unique ID based on immutable student ID
-        self._attr_unique_id = f"schulmanager_{self.student_id}_next_exam_days"
+        # Stable unique ID, scoped to this config entry so the same student
+        # appearing in another entry does not collide with it.
+        entry_id = self.coordinator.config_entry.entry_id
+        self._attr_unique_id = f"schulmanager_{entry_id}_{self.student_id}_next_exam_days"
 
         # Use translation for entity name
         self._attr_translation_key = "next_exam_days"
@@ -1474,8 +1369,10 @@ class SchoolDiagnosticSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorE
         self._school_name = school_name
         self._school_id = school_id
 
-        # Unique ID based on student ID
-        self._attr_unique_id = f"schulmanager_{self.student_id}_school"
+        # Stable unique ID, scoped to this config entry so the same student
+        # appearing in another entry does not collide with it.
+        entry_id = self.coordinator.config_entry.entry_id
+        self._attr_unique_id = f"schulmanager_{entry_id}_{self.student_id}_school"
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -1540,7 +1437,10 @@ class CurrentLessonSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEnti
         self.client = client
         self.student_id = student_id
         self.student_name = student_name
-        self._attr_unique_id = f"schulmanager_{student_id}_current_lesson"
+        # Stable unique ID, scoped to this config entry so the same student
+        # appearing in another entry does not collide with it.
+        entry_id = self.coordinator.config_entry.entry_id
+        self._attr_unique_id = f"schulmanager_{entry_id}_{student_id}_current_lesson"
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -1754,7 +1654,10 @@ class WochenplanJsonSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEnt
         self.client = client
         self.student_id = student_id
         self.student_name = student_name
-        self._attr_unique_id = f"schulmanager_{student_id}_wochenplan_json"
+        # Stable unique ID, scoped to this config entry so the same student
+        # appearing in another entry does not collide with it.
+        entry_id = self.coordinator.config_entry.entry_id
+        self._attr_unique_id = f"schulmanager_{entry_id}_{student_id}_wochenplan_json"
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -1836,23 +1739,36 @@ class WochenplanJsonSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEnt
         # periods[period_num][day_index 0-4] = subject_label
         periods: dict[str, dict[int, str]] = {}
         period_times: dict[str, tuple[str, str]] = {}  # period_num -> (from, until)
+        # Collect all lessons per (period, day) first so same-hour lessons
+        # (e.g. a cancellation plus its substitution/event) can be combined
+        # into one cell label instead of the last one silently overwriting
+        # the others.
+        cell_lessons: dict[tuple[str, int], list[dict[str, Any]]] = {}
 
         for day_offset in range(5):
             day_str = (monday + timedelta(days=day_offset)).isoformat()
             for lesson in week_map.get(day_str, []):
                 ch = lesson.get("classHour") or {}
-                period_num = str(ch.get("number", "?"))
+                # Schulmanager sometimes sends the period number with a
+                # trailing "." (e.g. "4."); normalize it once here so sorting
+                # and the "Stunde" label below don't inherit a stray dot.
+                period_num = str(ch.get("number", "?")).rstrip(".")
                 if period_num not in periods:
                     periods[period_num] = {}
                     period_times[period_num] = (
                         str(ch.get("from") or ""),
                         str(ch.get("until") or ""),
                     )
-                periods[period_num][day_offset] = self._subject_label(lesson)
+                cell_lessons.setdefault((period_num, day_offset), []).append(lesson)
 
-        def _sort_key(p: str) -> int:
-            try:
+        for (period_num, day_offset), lessons in cell_lessons.items():
+            periods[period_num][day_offset] = self._combine_subject_labels(lessons)
+
+        def _sort_key(p: str) -> float:
+            if p.isdigit():
                 return int(p)
+            try:
+                return float(p.replace(",", "."))
             except (ValueError, TypeError):
                 return 999
 
@@ -1901,4 +1817,31 @@ class WochenplanJsonSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEnt
         if lesson_type in ("substitution", "teacherChange"):
             return f"{subject_abbr} ↔" if subject_abbr else "↔"
 
+        if not subject_abbr and lesson_type not in ("regularLesson", ""):
+            # e.g. type "event" typically has no actualLesson.subject - fall
+            # back to the known German type label instead of an empty cell.
+            return LESSON_TYPE_LABELS.get(lesson_type, lesson_type)
+
         return subject_abbr
+
+    @staticmethod
+    def _combine_subject_labels(lessons: list[dict[str, Any]]) -> str:
+        """Combine same-hour lessons into one cell label.
+
+        A cancelled lesson and its same-hour substitution/event previously
+        overwrote each other (only the last-processed one survived); both
+        are now shown, e.g. "Bio ✗ → Veranstaltung".
+        """
+        if len(lessons) == 1:
+            return WochenplanJsonSensor._subject_label(lessons[0])
+
+        cancelled = [lsn for lsn in lessons if lsn.get("type") == "cancelledLesson"]
+        others = [lsn for lsn in lessons if lsn.get("type") != "cancelledLesson"]
+
+        labels = [
+            WochenplanJsonSensor._subject_label(lesson)
+            for lesson in (*cancelled, *others)
+        ]
+        # Keep order, drop empties and exact duplicates.
+        unique_labels = list(dict.fromkeys(label for label in labels if label))
+        return " → ".join(unique_labels)

@@ -172,6 +172,8 @@ class SchulmanagerCoordinator(DataUpdateCoordinator[IntegrationData]):
         for subject_id, subject in subjects.items():
             for category, grades_list in (subject.get("grades") or {}).items():
                 for g in grades_list or []:
+                    if not g.get("fires_event", True):
+                        continue
                     orig = str(g.get("original_value", g.get("value", "")))
                     date = str(g.get("date", ""))
                     topic = str(g.get("topic", ""))
@@ -187,6 +189,8 @@ class SchulmanagerCoordinator(DataUpdateCoordinator[IntegrationData]):
             subject_name = subject.get("name", f"Fach {subject_id}")
             for category, grades_list in (subject.get("grades") or {}).items():
                 for g in grades_list or []:
+                    if not g.get("fires_event", True):
+                        continue
                     orig = str(g.get("original_value", g.get("value", "")))
                     date = str(g.get("date", ""))
                     topic = str(g.get("topic", ""))

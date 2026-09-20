@@ -49,7 +49,12 @@ USER_SCHEMA = vol.Schema(
 class SchulmanagerConfigFlow(ConfigFlow, domain=DOMAIN):
     """Config flow for the Schulmanager integration."""
 
-    VERSION = 1
+    # Must match the highest version handled by async_migrate_entry in
+    # __init__.py - Home Assistant only calls async_migrate_entry when
+    # entry.version < VERSION, so a stale VERSION here silently skips all
+    # pending migrations (this was the case until 2026-09-20: VERSION stayed
+    # at 1 while migrations up to v3 existed but never ran).
+    VERSION = 7
     MINOR_VERSION = 1
 
     async def async_step_user(
@@ -108,7 +113,7 @@ class SchulmanagerConfigFlow(ConfigFlow, domain=DOMAIN):
                         options=DEFAULT_OPTIONS.copy(),
                     )
 
-        except Exception as err:
+        except Exception:
             _LOGGER.exception("Failed to connect to Schulmanager")
             errors["base"] = "cannot_connect"
 

@@ -6,6 +6,9 @@
       }
     },
     "sensor": {
+      "current_lesson": {
+        "name": "Current lesson"
+      },
       "schedule_today": {
         "name": "Schedule today"
       },
@@ -20,6 +23,12 @@
       },
       "next_exam_days": {
         "name": "Days until next exam"
+      },
+      "school": {
+        "name": "School"
+      },
+      "wochenplan_json": {
+        "name": "Weekly schedule JSON"
       }
     },
     "todo": {

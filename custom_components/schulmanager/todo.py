@@ -53,7 +53,7 @@ async def async_setup_entry(
         return
     try:
         students = client.get_all_students()
-    except Exception as err:  # noqa: BLE001 - defensive guard for setup
+    except Exception as err:
         _LOGGER.exception("Failed to load students for todo: %s", err)
         return
 
@@ -90,8 +90,10 @@ class HomeworkTodoList(CoordinatorEntity[SchulmanagerCoordinator], TodoListEntit
         self.client = client
         self.student_id = student_id
         self.student_name = student_name
-        # Stable unique ID based on immutable student ID
-        self._attr_unique_id = f"schulmanager_{self.student_id}_homework"
+        # Stable unique ID, scoped to this config entry so the same student
+        # appearing in another entry does not collide with it.
+        entry_id = self.coordinator.config_entry.entry_id
+        self._attr_unique_id = f"schulmanager_{entry_id}_{self.student_id}_homework"
         # Entity name via translations
         self._attr_translation_key = "homework"
         self._attr_icon = "mdi:clipboard-check-multiple-outline"

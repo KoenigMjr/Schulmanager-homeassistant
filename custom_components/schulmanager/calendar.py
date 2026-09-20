@@ -50,7 +50,7 @@ async def async_setup_entry(
 
     try:
         students = client.get_all_students()
-    except Exception as err:  # noqa: BLE001 - defensive guard for setup
+    except Exception as err:
         _LOGGER.exception("Failed to load students for calendar: %s", err)
         return
 
@@ -99,8 +99,10 @@ class ExamCalendarBase(CalendarEntity):
         self.coordinator = coordinator
         self.student_id = student_id
         self.student_name = student_name
-        # Stable unique ID based on immutable student ID
-        self._attr_unique_id = f"schulmanager_{self.student_id}_{unique_suffix}"
+        # Stable unique ID, scoped to this config entry so the same student
+        # appearing in another entry does not collide with it.
+        entry_id = coordinator.config_entry.entry_id
+        self._attr_unique_id = f"schulmanager_{entry_id}_{self.student_id}_{unique_suffix}"
         # Full name with student for clarity
         self._attr_name = f"{self.student_name} {name_suffix}"
         self._attr_icon = icon
@@ -390,7 +392,10 @@ class ScheduleCalendar(CalendarEntity):
         self.coordinator = coordinator
         self.student_id = student_id
         self.student_name = student_name
-        self._attr_unique_id = f"schulmanager_{self.student_id}_schedule"
+        # Stable unique ID, scoped to this config entry so the same student
+        # appearing in another entry does not collide with it.
+        entry_id = coordinator.config_entry.entry_id
+        self._attr_unique_id = f"schulmanager_{entry_id}_{self.student_id}_schedule"
         self._attr_name = f"{self.student_name} Stundenplan"
         self._attr_icon = "mdi:calendar-school"
         self.highlight = highlight

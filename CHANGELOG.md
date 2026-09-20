@@ -1,5 +1,29 @@
 # Schulmanager Integration – Changelog
 
+## 0.10.0 (2026-09-20)
+
+### ✨ Neues
+
+- **Unterstützung für das Punktesystem der gymnasialen Oberstufe**
+  - Endnoten werden jetzt auch für Kurse mit dem 0–15-Punkte-System (Sek II) korrekt dargestellt, nicht nur für die klassische 1–6-Notenskala
+  - Funktioniert automatisch für alle entsprechend eingestellten Kurse – keine Konfiguration nötig
+
+### 🐛 Bugfixes
+
+- **Noten teilweise für falsches Schuljahr abgerufen**
+  - Problem: Ein interner, veralteter Kennwert führte in seltenen Fällen dazu, dass Noten aus einem vergangenen statt dem aktuellen Schuljahr geladen wurden
+  - Lösung: Das aktuelle Schuljahr wird jetzt automatisch korrekt ermittelt
+
+- **Updates an bestehenden Installationen liefen teilweise nicht durch**
+  - Problem: Ein interner Fehler verhinderte, dass fällige Aktualisierungsschritte bei bestehenden Installationen ausgeführt wurden
+  - Lösung: Wird beim nächsten Update automatisch nachgeholt, keine Aktion nötig
+
+- **Sensoren/Kalender konnten bei mehreren Zugängen zum selben Schüler verschwinden**
+  - Problem: War derselbe Schüler über mehr als einen Zugang eingebunden, konnten Sensoren und Kalender des zusätzlichen Zugangs kommentarlos verschwinden
+  - Lösung: Behoben – bestehende Dashboards und Automatisierungen bleiben unverändert erhalten
+
+---
+
 ## 0.9.1 (2026-05-13)
 
 ### ✨ Neues

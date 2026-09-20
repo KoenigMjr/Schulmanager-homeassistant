@@ -11,18 +11,20 @@ later if we further constrain error types upstream.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from datetime import date, timedelta
 import hashlib
 import json
 import logging
 from pathlib import Path
 import re
-from typing import Any, cast
+from typing import Any, Final, cast
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.util import dt as dt_util
 
+from . import grading
 from .types import GradesPayload, ScheduleChange, SchedulePayload
 from .utils import common_headers, ensure_authenticated, sanitize_for_log
 
@@ -30,6 +32,12 @@ LOGIN_URL = "https://login.schulmanager-online.de/api/login"
 GET_SALT_URL = "https://login.schulmanager-online.de/api/get-salt"
 CALLS_URL = "https://login.schulmanager-online.de/api/calls"
 INDEX_URL = "https://login.schulmanager-online.de/"
+
+# Pre-fix hardcoded termId for grades requests. The grades endpoint is the
+# only one in this API that ever needed a termId; every other endpoint
+# (homework, exams, schedule) works from start/end dates alone. Kept only
+# as a last-resort fallback if omitting termId stops working.
+LEGACY_TERM_ID: Final = 28592
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -88,6 +96,54 @@ class SchulmanagerClient:
     def get_students(self) -> list[dict[str, Any]]:
         """Return the discovered students for this account."""
         return list(self._students)
+
+    @staticmethod
+    def _student_from_record(record: dict[str, Any]) -> dict[str, Any] | None:
+        """Build a student dict from a raw student record, or None if unusable."""
+        sid = record.get("id")
+        if not sid:
+            return None
+        name = (
+            f"{record.get('firstname', '')} {record.get('lastname', '')}".strip()
+            or "Schüler"
+        )
+        return {"id": str(sid), "classId": record.get("classId"), "name": name}
+
+    @classmethod
+    def _extract_students(cls, user: dict[str, Any]) -> list[dict[str, Any]]:
+        """Extract students from a login response's user object.
+
+        Parent accounts list their children under "associatedParents". Student
+        accounts have no parents module, so their own record lives directly on
+        the user object instead - either as a singular "associatedStudent"
+        dict, or (for some school configurations) a plural
+        "associatedStudents" list.
+        """
+        students: list[dict[str, Any]] = []
+
+        for p in user.get("associatedParents") or []:
+            st = (p or {}).get("student") or {}
+            student = cls._student_from_record(st)
+            if student is not None:
+                students.append(student)
+
+        if not students:
+            student_records: list[dict[str, Any]] = []
+            single = user.get("associatedStudent")
+            if isinstance(single, dict):
+                student_records.append(single)
+            student_records.extend(
+                record
+                for record in user.get("associatedStudents") or []
+                if isinstance(record, dict)
+            )
+
+            for record in student_records:
+                student = cls._student_from_record(record)
+                if student is not None:
+                    students.append(student)
+
+        return students
 
     def clear_auth_cache(self) -> None:
         """Clear cached authentication and bundle version."""
@@ -252,21 +308,7 @@ class SchulmanagerClient:
                 if self._institution_id:
                     _LOGGER.debug("Extracted institutionId from login: %s", self._institution_id)
 
-            parents = user.get("associatedParents") or []
-            self._students = []
-
-            for p in parents:
-                st = (p or {}).get("student") or {}
-                sid = st.get("id")
-                if not sid:
-                    continue
-                name = (
-                    f"{st.get('firstname', '')} {st.get('lastname', '')}".strip()
-                    or "Schüler"
-                )
-                self._students.append(
-                    {"id": str(sid), "classId": st.get("classId"), "name": name}
-                )
+            self._students = self._extract_students(user)
 
             await self._dump("students_extracted.json", self._students)
 
@@ -482,6 +524,51 @@ class SchulmanagerClient:
         await self._dump(f"hausaufgaben_{student_id}.json", data)
         return data if isinstance(data, list) else []
 
+    @staticmethod
+    def _convert_calendar_event_to_exam(event: dict[str, Any]) -> dict[str, Any] | None:
+        """Convert a school-wide calendar event (real UTC timestamps) into exam-shaped data.
+
+        The calendar/events endpoint returns genuinely timezone-aware UTC
+        timestamps (e.g. "2026-08-28T11:30:00.000Z"), unlike every other
+        schedule/exam time in this API which is already naive local wall-clock
+        time. Converting to local *before* deriving the date/time strings is
+        required - otherwise the raw UTC digits get treated as local further
+        downstream (calendar.py's `as_local()` only tags naive datetimes as
+        local, it does not convert them), producing a 1-2h display offset.
+        """
+        start_dt = dt_util.parse_datetime(event.get("start", ""))
+        end_dt = dt_util.parse_datetime(event.get("end", ""))
+        if start_dt is None:
+            return None
+
+        start_dt = dt_util.as_local(start_dt)
+        if end_dt is not None:
+            end_dt = dt_util.as_local(end_dt)
+
+        start_time = start_dt.strftime("%H:%M:%S")
+        end_time = end_dt.strftime("%H:%M:%S") if end_dt is not None else start_time
+
+        return {
+            "id": event.get("id"),
+            "date": start_dt.date().isoformat(),
+            "subject": {
+                "name": event.get("summary", "Prüfung"),
+                "abbreviation": event.get("summary", "")[:3].upper(),
+            },
+            "subjectText": event.get("summary"),
+            "comment": event.get("description"),
+            "type": {
+                "name": "Schul-Event",
+                "color": "#ff0000",
+                "visibleForStudents": True,
+            },
+            "startClassHour": {"from": start_time, "until": end_time, "number": "X"},
+            "endClassHour": {"from": end_time, "until": end_time, "number": "X"},
+            "createdAt": event.get("createdAt"),
+            "updatedAt": event.get("updatedAt"),
+            "_isCalendarEvent": True,  # Flag to identify source
+        }
+
     async def fetch_exams(
         self, student_id: str, class_id: int | None = None, date_range_config: dict[str, int] | None = None
     ) -> list[dict]:
@@ -619,42 +706,9 @@ class SchulmanagerClient:
             if len(results) > 1 and results[1].get("status") == 200:
                 calendar_events = results[1].get("data", [])
                 if isinstance(calendar_events, list):
-                    # Convert calendar events to exam format
                     for event in calendar_events:
-                        # Parse ISO datetime to get date and time
-                        start_dt = dt_util.parse_datetime(event.get("start", ""))
-                        end_dt = dt_util.parse_datetime(event.get("end", ""))
-
-                        if start_dt:
-                            # Convert calendar event to exam format
-                            exam_event = {
-                                "id": event.get("id"),
-                                "date": start_dt.date().isoformat(),
-                                "subject": {
-                                    "name": event.get("summary", "Prüfung"),
-                                    "abbreviation": event.get("summary", "")[:3].upper()
-                                },
-                                "subjectText": event.get("summary"),
-                                "comment": event.get("description"),
-                                "type": {
-                                    "name": "Schul-Event",
-                                    "color": "#ff0000",
-                                    "visibleForStudents": True
-                                },
-                                "startClassHour": {
-                                    "from": start_dt.strftime("%H:%M:%S"),
-                                    "until": end_dt.strftime("%H:%M:%S") if end_dt else start_dt.strftime("%H:%M:%S"),
-                                    "number": "X"
-                                },
-                                "endClassHour": {
-                                    "from": end_dt.strftime("%H:%M:%S") if end_dt else start_dt.strftime("%H:%M:%S"),
-                                    "until": end_dt.strftime("%H:%M:%S") if end_dt else start_dt.strftime("%H:%M:%S"),
-                                    "number": "X"
-                                },
-                                "createdAt": event.get("createdAt"),
-                                "updatedAt": event.get("updatedAt"),
-                                "_isCalendarEvent": True  # Flag to identify source
-                            }
+                        exam_event = self._convert_calendar_event_to_exam(event)
+                        if exam_event is not None:
                             all_exams.append(exam_event)
 
                     _LOGGER.debug("Found %d calendar exam events for student %s", len(calendar_events), student_id)
@@ -1179,118 +1233,71 @@ class SchulmanagerClient:
         # Last resort: create a generic name
         return f"Fach {subject_id}", f"F{str(subject_id)[-2:]}"
 
-    def _parse_german_grade(self, grade_value: str | float) -> float | None:
-        """Parse German grade formats and return numeric value.
-
-        Handles formats like:
-        - "0~3" -> 3.0
-        - "0~3+" -> 3.0
-        - "0~2-" -> 2.0
-        - "3+" -> 3.0
-        - "2-" -> 2.0
-        - "2.5" -> 2.5
-        """
-        if not grade_value and grade_value != 0:
-            return None
-
-        # Handle direct numeric values
-        if isinstance(grade_value, (int, float)):
-            return float(grade_value)
-
-        grade_str = str(grade_value).strip()
-        if not grade_str:
-            return None
-
-        # Handle format "0~3" or "0~3+" or "0~2-" -> extract after tilde
-        if "~" in grade_str:
-            try:
-                # Split by tilde and get the part after it
-                grade_part = grade_str.split("~")[1]
-                # Remove tendency markers (+/-)
-                if grade_part.endswith(("+", "-")):
-                    grade_part = grade_part[:-1]
-                return float(grade_part)
-            except (ValueError, IndexError):
-                return None
-
-        # Handle formats like "4+", "4-", "2+" (without tilde prefix)
-        if grade_str.endswith(("+", "-")):
-            try:
-                # Treat both 4+ and 4- as 4.0 (ignore plus/minus for calculation)
-                return float(grade_str[:-1])
-            except ValueError:
-                return None
-
-        # Handle decimal grades like "2.5", "3.7"
-        try:
-            return float(grade_str)
-        except ValueError:
-            return None
-
-    def _calculate_subject_average(self, grade_categories: dict[str, list[dict[str, Any]]]) -> float | None:
-        """Calculate simple average of all grades in a subject."""
-        if not grade_categories:
-            return None
-
-        all_grades = []
-
-        # Collect all numeric grades from all categories
-        for grades_list in grade_categories.values():
-            if not grades_list:
-                continue
-
-            for grade in grades_list:
-                grade_value = grade.get("value", "")
-
-                # Extract numeric value from German grade format
-                numeric_grade = self._parse_german_grade(grade_value)
-
-                # Validate German grade range (1.0 - 6.0)
-                if numeric_grade is not None and 1.0 <= numeric_grade <= 6.0:
-                    all_grades.append(numeric_grade)
-
-        if not all_grades:
-            return None
-
-        # Calculate simple average and round to 2 decimal places
-        average = sum(all_grades) / len(all_grades)
-        return round(average, 2)
-
-    async def fetch_grades(self, student_id: str, class_id: int | None = None) -> GradesPayload:
-        """Fetch grades for a student using the proper grades API."""
-        sid = int(student_id)
-
-        # Get bundle version (with fallback to dummy value)
-        bundle_version = await self._discover_bundle_version()
-
-        # Calculate full academic year range (August to July)
-        today = dt_util.now().date()
+    @staticmethod
+    def _school_year_range(today: date) -> tuple[date, date]:
+        """Return the (start, end) dates spanning the current school year (Aug-Jul)."""
         if today.month >= 8:
-            # Current school year: August YYYY to July YYYY+1
-            start_date = today.replace(month=8, day=1)
-            end_date = today.replace(year=today.year + 1, month=7, day=31)
-        else:
-            # Previous school year: August YYYY-1 to July YYYY
-            start_date = today.replace(year=today.year - 1, month=8, day=1)
-            end_date = today.replace(month=7, day=31)
+            return (
+                today.replace(month=8, day=1),
+                today.replace(year=today.year + 1, month=7, day=31),
+            )
+        return (
+            today.replace(year=today.year - 1, month=8, day=1),
+            today.replace(month=7, day=31),
+        )
 
-        # For now, we'll use a fixed termId - this might need to be discovered
-        # Based on the API response, termId seems to be related to the school term
-        term_id = 28592  # This should ideally be discovered from the API
+    @staticmethod
+    def _grades_request_params(
+        sid: int, start_date: date, end_date: date, term_id: int | None
+    ) -> dict[str, Any]:
+        """Build grades endpoint parameters for a given termId (None omits it)."""
+        params: dict[str, Any] = {
+            "studentId": sid,
+            "start": start_date.isoformat(),
+            "end": end_date.isoformat(),
+            "gradingPeriodType": "entireYear",
+        }
+        if term_id is not None:
+            params["termId"] = term_id
+        return params
 
-        # Create request payload exactly like the browser
-        grades_payload = {
+    @staticmethod
+    def _courses_cover_date(courses: list[dict[str, Any]], target: date) -> bool:
+        """Check whether any course's start/end window covers the target date.
+
+        An empty course list is not treated as stale - it just means no
+        courses/grades are available (yet), not that the wrong term was fetched.
+        """
+        if not courses:
+            return True
+        for course in courses:
+            try:
+                start = date.fromisoformat(course["start"])
+                end = date.fromisoformat(course["end"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if start <= target <= end:
+                return True
+        return False
+
+    async def _fetch_grades_data(
+        self,
+        sid: int,
+        student_id: str,
+        start_date: date,
+        end_date: date,
+        term_id: int | None,
+        bundle_version: str | None,
+    ) -> dict[str, Any] | None:
+        """POST the grades request for one termId and return raw grades data."""
+        grades_payload: dict[str, Any] = {
             "requests": [
                 {
                     "moduleName": "grades",
                     "endpointName": "get-grading-information-for-student",
-                    "parameters": {
-                        "studentId": sid,
-                        "termId": term_id,
-                        "start": start_date.isoformat(),
-                        "end": end_date.isoformat(),
-                        "gradingPeriodType": "entireYear"
-                    }
+                    "parameters": self._grades_request_params(
+                        sid, start_date, end_date, term_id
+                    ),
                 }
             ]
         }
@@ -1305,29 +1312,113 @@ class SchulmanagerClient:
             "Authorization": f"Bearer {self._token}",
         }
 
-        _LOGGER.debug("Fetching grades for student %s (term %s)", student_id, term_id)
+        _LOGGER.debug("Fetching grades for student %s (termId %s)", student_id, term_id)
 
         async with sess.post(CALLS_URL, json=grades_payload, headers=headers) as response:
             if response.status != 200:
                 _LOGGER.error("Grades fetch failed with status %d", response.status)
-                return {
-                    "subjects": {},
-                    "overall_average": None,
-                    "total_subjects": 0,
-                    "subjects_with_grades": 0,
-                }
+                return None
 
             response_data = await response.json()
             await self._dump(f"grades_response_{student_id}.json", response_data)
 
-            # Parse response
-            results = response_data.get("results", [])
-            for result in results:
+            for result in response_data.get("results", []):
                 if result.get("status") == 200 and "data" in result:
-                    grades_data = result["data"]
-                    return await self._process_grades_data(grades_data)
+                    return cast(dict[str, Any], result["data"])
 
             _LOGGER.debug("No grades found for student %s", student_id)
+            return None
+
+    async def _discover_term_id(
+        self, class_id: int, bundle_version: str | None
+    ) -> int | None:
+        """Discover the current termId via the class record's termId field.
+
+        Schulmanager exposes no dedicated "current term" endpoint, but the
+        generic query endpoint ("poqa": perform-object-query-action) used
+        elsewhere for e.g. subjects can look up "main/class" by id, and that
+        record carries the school's current termId. This was confirmed by
+        live-testing against the real API (2026-09-20): querying a class
+        returns e.g. {"name": "9b", "termId": 33883, ...} where 33883 is the
+        actual current-year term, as opposed to a stale hardcoded value.
+        """
+        payload: dict[str, Any] = {
+            "requests": [
+                {
+                    "moduleName": "grades",
+                    "endpointName": "poqa",
+                    "parameters": {
+                        "action": {
+                            "model": "main/class",
+                            "action": "findAll",
+                            "parameters": [{"where": {"id": class_id}}],
+                        },
+                        "uiState": "main.modules.grades.student",
+                    },
+                }
+            ]
+        }
+        # The poqa endpoint rejects requests without a bundleVersion (HTTP 400).
+        payload["bundleVersion"] = bundle_version or "0000000000"
+
+        sess = async_get_clientsession(self.hass)
+        headers = common_headers() | {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self._token}",
+        }
+
+        async with sess.post(CALLS_URL, json=payload, headers=headers) as response:
+            if response.status != 200:
+                return None
+            response_data = await response.json()
+
+        for result in response_data.get("results", []):
+            if result.get("status") == 200:
+                classes = result.get("data") or []
+                if classes:
+                    term_id = classes[0].get("termId")
+                    if isinstance(term_id, int):
+                        return term_id
+        return None
+
+    async def fetch_grades(self, student_id: str, class_id: int | None = None) -> GradesPayload:
+        """Fetch grades for a student using the proper grades API."""
+        sid = int(student_id)
+
+        # Get bundle version (with fallback to dummy value)
+        bundle_version = await self._discover_bundle_version()
+
+        today = dt_util.now().date()
+        start_date, end_date = self._school_year_range(today)
+
+        term_id: int | None = None
+        if class_id is not None:
+            term_id = await self._discover_term_id(class_id, bundle_version)
+        if term_id is None:
+            term_id = LEGACY_TERM_ID
+            _LOGGER.warning(
+                "Could not discover current termId for class %s; "
+                "falling back to legacy termId=%s",
+                class_id,
+                LEGACY_TERM_ID,
+            )
+
+        grades_data = await self._fetch_grades_data(
+            sid, student_id, start_date, end_date, term_id, bundle_version
+        )
+
+        if grades_data is not None and not self._courses_cover_date(
+            grades_data.get("courses", []), today
+        ):
+            _LOGGER.warning(
+                "Grades for student %s look stale: no course covers %s "
+                "(termId=%s likely belongs to a previous school year)",
+                student_id,
+                today.isoformat(),
+                term_id,
+            )
+
+        if grades_data is None:
             return {
                 "subjects": {},
                 "overall_average": None,
@@ -1335,15 +1426,208 @@ class SchulmanagerClient:
                 "subjects_with_grades": 0,
             }
 
+        return await self._process_grades_data(grades_data)
+
+    @staticmethod
+    def _split_grade_value(
+        grade_value: str | float, grading_system: int
+    ) -> tuple[float | int | str, str | float | int, str | None]:
+        """Parse a raw grade value into (numeric-or-raw value, display value, tendency)."""
+        parsed_value = grading.parse_grade_value(grade_value, grading_system)
+        tendency = None
+        display_value: str | float | int = grade_value
+
+        if isinstance(grade_value, str):
+            if grade_value.endswith("+"):
+                tendency = "plus"
+            elif grade_value.endswith("-"):
+                tendency = "minus"
+            if "~" in grade_value:
+                # "0~3+" -> "3+", "1~5" -> "5"
+                display_value = grade_value.split("~")[1]
+
+        value = parsed_value if parsed_value is not None else grade_value
+        return value, display_value, tendency
+
+    @staticmethod
+    def _build_block_weighting(
+        block_presets: list[dict[str, Any]],
+    ) -> tuple[dict[int, dict[int, float]], dict[int, str]]:
+        """Build (courseId -> blockId -> weighting) and (blockId -> name) from blockPresets.
+
+        Per-course block weighting (e.g. Klassenarbeiten 50% / Sonstige 50%)
+        feeds grading.calculate_average; block names drive the (coarser)
+        display category grouping.
+        """
+        course_block_weighting: dict[int, dict[int, float]] = {}
+        block_names: dict[int, str] = {}
+        for block_preset in block_presets:
+            course_id = block_preset.get("courseId")
+            block = block_preset.get("gradingBlock") or {}
+            block_id = block.get("id")
+            if course_id is None or block_id is None:
+                continue
+            course_block_weighting.setdefault(course_id, {})[block_id] = block_preset.get(
+                "weighting", 1
+            )
+            if block_id not in block_names:
+                block_names[block_id] = block.get("name") or f"Block {block_id}"
+        return course_block_weighting, block_names
+
+    def _process_grading_events(
+        self,
+        grading_events: list[dict[str, Any]],
+        course_map: dict[int, dict[str, Any]],
+        type_map: dict[int, dict[str, Any]],
+        course_block_weighting: dict[int, dict[int, float]],
+        block_names: dict[int, str],
+        ensure_subject: Callable[[int, int], dict[str, Any]],
+    ) -> dict[tuple[int, int], list[dict[str, Any]]]:
+        """Process gradingEvents (actual grades) into each subject's grade categories.
+
+        Returns the (courseId, gradeTypeId) -> entries groups, used afterwards
+        to apply repeat-exam overrides across the exact same exam slot.
+        """
+        repeat_groups: dict[tuple[int, int], list[dict[str, Any]]] = {}
+
+        for event in grading_events:
+            course_id = event.get("courseId")
+            if course_id not in course_map:
+                continue
+
+            course = course_map[course_id]
+            subject_id = course.get("subjectId")
+            if not subject_id:
+                continue
+
+            subject = ensure_subject(subject_id, course_id)
+            grading_system = subject["grading_system"]
+
+            grade_type_id = event.get("gradeTypeId")
+            grade_type_info = type_map.get(grade_type_id if isinstance(grade_type_id, int) else -1, {})
+
+            block_id = event.get("gradingBlockId")
+            block_weighting = course_block_weighting.get(course_id, {}).get(block_id, 1.0)
+            # Fall back to the fine-grained type name if the block isn't known
+            # (e.g. blockPresets missing for a just-created course).
+            category_name = block_names.get(block_id, grade_type_info.get("name", "Sonstige"))
+
+            for grade_data in event.get("grades", []):
+                grade_value = grade_data.get("value")
+                if grade_value is None or grade_value == "":
+                    continue
+
+                value, display_value, tendency = self._split_grade_value(grade_value, grading_system)
+
+                grade_entry: dict[str, Any] = {
+                    "value": value,
+                    "display_value": display_value,  # Clean notation for display (e.g. "3+", "2-", "5")
+                    "original_value": grade_value,  # Keep API format for debugging
+                    "tendency": tendency,  # "plus", "minus", or None
+                    "date": event.get("date"),
+                    "topic": event.get("topic", ""),
+                    "weighting": event.get("weighting", 1),
+                    "duration": event.get("durationInMinutes"),
+                    "type_abbreviation": grade_type_info.get("abbreviation", ""),
+                    "is_repeat_exam": grade_data.get("isRepeatExam", False),
+                    "grading_block_id": block_id,
+                    "block_weighting": block_weighting,
+                }
+
+                # Add to appropriate category (only create categories that have grades)
+                if category_name not in subject["grades"]:
+                    subject["grades"][category_name] = []
+                subject["grades"][category_name].append(grade_entry)
+
+                if isinstance(grade_type_id, int):
+                    repeat_groups.setdefault((course_id, grade_type_id), []).append(grade_entry)
+
+        return repeat_groups
+
+    @staticmethod
+    def _apply_repeat_exam_overrides(
+        repeat_groups: dict[tuple[int, int], list[dict[str, Any]]],
+    ) -> None:
+        """A repeat exam (isRepeatExam=True) replaces the grade(s) it retakes.
+
+        Excludes the non-repeat entries of the same exam slot from the
+        average (mutates them in place), but keeps them visible for
+        transparency.
+        """
+        for group in repeat_groups.values():
+            if any(entry["is_repeat_exam"] for entry in group):
+                for entry in group:
+                    if not entry["is_repeat_exam"]:
+                        entry["counts_toward_average"] = False
+
+    def _process_final_grades(
+        self,
+        final_grades: list[dict[str, Any]],
+        course_map: dict[int, dict[str, Any]],
+        ensure_subject: Callable[[int, int], dict[str, Any]],
+    ) -> None:
+        """Process finalGrades (Tendenz) into each subject's grade categories.
+
+        At the start of a school year, before individual gradingEvents
+        exist, this is the only source of a current grade. Shown to the
+        user but excluded from notifications and averaging (see
+        grading.calculate_average's docstring).
+        """
+        for final_grade in final_grades:
+            course_id = final_grade.get("courseId")
+            if course_id not in course_map:
+                continue
+
+            course = course_map[course_id]
+            subject_id = course.get("subjectId")
+            if not subject_id:
+                continue
+
+            grade_value = final_grade.get("value")
+            if grade_value is None or grade_value == "":
+                continue
+
+            subject = ensure_subject(subject_id, course_id)
+            grading_system = subject["grading_system"]
+
+            value, display_value, tendency = self._split_grade_value(grade_value, grading_system)
+
+            grade_entry = {
+                "value": value,
+                "display_value": display_value,
+                "original_value": grade_value,
+                "tendency": tendency,
+                "date": None,
+                "topic": "",
+                "weighting": 1,
+                "duration": None,
+                "type_abbreviation": "",
+                "is_repeat_exam": False,
+                "fires_event": False,
+                "counts_toward_average": False,
+            }
+
+            subject["grades"].setdefault(grading.FINAL_GRADE_CATEGORY, []).append(grade_entry)
+
     async def _process_grades_data(self, grades_data: dict) -> GradesPayload:
         """Process raw grades data into structured format by subject."""
         courses: list[dict[str, Any]] = grades_data.get("courses", [])
         grading_events: list[dict[str, Any]] = grades_data.get("gradingEvents", [])
+        final_grades: list[dict[str, Any]] = grades_data.get("finalGrades", [])
         type_presets: list[dict[str, Any]] = grades_data.get("typePresets", [])
+        block_presets: list[dict[str, Any]] = grades_data.get("blockPresets", [])
 
         # Create mapping from course ID to course info
         course_map: dict[int, dict[str, Any]] = {
             int(course["id"]): course for course in courses if "id" in course
+        }
+        # gradingPreset can be missing entirely (not just gradingSystem=0),
+        # which also means the classic scale applies.
+        course_grading_system: dict[int, int] = {
+            course_id: (course.get("gradingPreset") or {}).get(
+                "gradingSystem", grading.GRADING_SYSTEM_CLASSIC
+            )
+            for course_id, course in course_map.items()
         }
 
         # Create mapping from gradeTypeId to type info
@@ -1352,6 +1636,8 @@ class SchulmanagerClient:
             if "gradeType" in preset:
                 grade_type = preset["gradeType"]
                 type_map[grade_type["id"]] = grade_type
+
+        course_block_weighting, block_names = self._build_block_weighting(block_presets)
 
         # Group grades by subject using subjectId as the key
         subjects: dict[int, dict[str, Any]] = {}
@@ -1370,90 +1656,48 @@ class SchulmanagerClient:
             if subject_id not in subject_info or (course_name and len(course_name) > 3):
                 subject_info[subject_id] = (subject_name, subject_abbrev)
 
-        # Process grading events (actual grades)
-        for event in grading_events:
-            course_id = event.get("courseId")
-            if course_id not in course_map:
-                continue
-
-            course = course_map[course_id]
-            subject_id = course.get("subjectId")
-            if not subject_id:
-                continue
-
-            # Initialize subject if not exists
+        def ensure_subject(subject_id: int, course_id: int) -> dict[str, Any]:
             if subject_id not in subjects:
-                # Get readable subject name and abbreviation
-                subject_name, subject_abbrev = subject_info.get(subject_id, (f"Fach {subject_id}", f"F{subject_id}"))
-
+                subject_name, subject_abbrev = subject_info.get(
+                    subject_id, (f"Fach {subject_id}", f"F{subject_id}")
+                )
                 subjects[subject_id] = {
                     "name": subject_name,
                     "abbreviation": subject_abbrev,
-                    "average": None,  # No average provided in API, would need calculation
-                    "grades": {}
+                    "average": None,  # Calculated below, once all grades are collected
+                    "grades": {},
+                    "grading_system": course_grading_system.get(
+                        course_id, grading.GRADING_SYSTEM_CLASSIC
+                    ),
                 }
+            return subjects[subject_id]
 
-            # Process grades in this event
-            for grade_data in event.get("grades", []):
-                grade_value = grade_data.get("value")
-                if not grade_value:
-                    continue
-
-                # Get grade type info
-                grade_type_id = event.get("gradeTypeId")
-                grade_type_info = type_map.get(grade_type_id if isinstance(grade_type_id, int) else -1, {})
-                grade_type_name = grade_type_info.get("name", "Sonstige")
-
-                # Create grade entry
-                # Normalize grade value: map formats like "0~2" -> 2.0, "0~3+" -> 3.0
-                parsed_value = self._parse_german_grade(grade_value)
-                tendency = None
-                display_value = grade_value  # Default to original
-
-                if isinstance(grade_value, str):
-                    # Extract tendency from original value
-                    if grade_value.endswith("+"):
-                        tendency = "plus"
-                    elif grade_value.endswith("-"):
-                        tendency = "minus"
-
-                    # Create clean display value (remove "0~" prefix if present)
-                    if "~" in grade_value:
-                        # "0~3+" -> "3+", "0~2" -> "2", "0~3-" -> "3-"
-                        display_value = grade_value.split("~")[1]
-                    # else: already clean ("3+", "2", "4-")
-
-                grade_entry = {
-                    # Store normalized numeric for calculations (3+ and 3- both = 3.0)
-                    "value": parsed_value if parsed_value is not None else grade_value,
-                    "display_value": display_value,  # Clean notation for display (e.g. "3+", "2-", "2")
-                    "original_value": grade_value,  # Keep API format for debugging
-                    "tendency": tendency,  # "plus", "minus", or None
-                    "date": event.get("date"),
-                    "topic": event.get("topic", ""),
-                    "weighting": event.get("weighting", 1),
-                    "duration": event.get("durationInMinutes"),
-                    "type_abbreviation": grade_type_info.get("abbreviation", ""),
-                    "is_repeat_exam": grade_data.get("isRepeatExam", False),
-                }
-
-                # Add to appropriate category (only create categories that have grades)
-                if grade_type_name not in subjects[subject_id]["grades"]:
-                    subjects[subject_id]["grades"][grade_type_name] = []
-                subjects[subject_id]["grades"][grade_type_name].append(grade_entry)
+        repeat_groups = self._process_grading_events(
+            grading_events, course_map, type_map, course_block_weighting, block_names, ensure_subject
+        )
+        self._apply_repeat_exam_overrides(repeat_groups)
+        self._process_final_grades(final_grades, course_map, ensure_subject)
 
         # Calculate averages for each subject
         all_subject_averages: list[float] = []
         for subject_data in subjects.values():
-            avg = self._calculate_subject_average(subject_data["grades"])
+            avg = grading.calculate_average(subject_data["grades"], subject_data["grading_system"])
             subject_data["average"] = avg
             if avg is not None:
                 all_subject_averages.append(avg)
 
-        # Calculate overall student average from all subject averages
+        # Calculate overall student average. Only classic-scale (1-6) subjects
+        # are blended into this single figure - averaging a 0-15 points-scale
+        # subject together with a 1-6 subject would be numerically meaningless.
+        classic_averages = [
+            subject_data["average"]
+            for subject_data in subjects.values()
+            if subject_data["average"] is not None
+            and subject_data["grading_system"] == grading.GRADING_SYSTEM_CLASSIC
+        ]
         overall_average = None
-        if all_subject_averages:
-            overall_average = round(sum(all_subject_averages) / len(all_subject_averages), 2)
+        if classic_averages:
+            overall_average = round(sum(classic_averages) / len(classic_averages), 1)
 
         return cast(
             GradesPayload,
@@ -1734,7 +1978,7 @@ class SchulmanagerHubClient:
                 )
                 try:
                     await client.async_login()
-                except Exception as err:  # noqa: BLE001 - try other variants
+                except Exception as err:
                     last_err = err
                     continue
 
