@@ -27,6 +27,9 @@
       "wochenplan_json": {
         "name": "Wochenplan JSON"
       },
+      "wochenplan_json_details": {
+        "name": "Wochenplan JSON Details"
+      },
       "school": {
         "name": "Schule"
       }

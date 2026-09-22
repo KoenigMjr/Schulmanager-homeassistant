@@ -29,6 +29,9 @@
       },
       "wochenplan_json": {
         "name": "Weekly schedule JSON"
+      },
+      "wochenplan_json_details": {
+        "name": "Weekly schedule JSON details"
       }
     },
     "todo": {

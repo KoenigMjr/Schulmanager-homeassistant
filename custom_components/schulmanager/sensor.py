@@ -119,6 +119,7 @@ async def async_setup_entry(
 
         # Add Wochenplan JSON sensor (for Stundenplan Card integration)
         entities.append(WochenplanJsonSensor(client, coord, sid, name, slug))
+        entities.append(WochenplanJsonDetailsSensor(client, coord, sid, name, slug))
 
     async_add_entities(entities)
 
@@ -1845,3 +1846,193 @@ class WochenplanJsonSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEnt
         # Keep order, drop empties and exact duplicates.
         unique_labels = list(dict.fromkeys(label for label in labels if label))
         return " → ".join(unique_labels)
+
+
+class WochenplanJsonDetailsSensor(WochenplanJsonSensor):
+    """Weekly schedule JSON including subject, room and teacher."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "wochenplan_json_details"
+    _attr_icon = "mdi:table-large"
+
+    def __init__(
+        self,
+        client: Any,
+        coordinator: SchulmanagerCoordinator,
+        student_id: str,
+        student_name: str,
+        slug: str,
+    ) -> None:
+        """Initialize the detailed weekly schedule JSON sensor."""
+        # Reuses all existing week-building and date logic.
+        super().__init__(
+            client,
+            coordinator,
+            student_id,
+            student_name,
+            slug,
+        )
+
+        # Use a separate unique ID and therefore a separate entity.
+        entry_id = self.coordinator.config_entry.entry_id
+        self._attr_unique_id = (
+            f"schulmanager_{entry_id}_{student_id}_"
+            "wochenplan_json_details"
+        )
+
+    @staticmethod
+    def _teacher_text(source: dict[str, Any]) -> str:
+        """Return teacher abbreviations or names."""
+        teachers = source.get("teachers") or []
+        names: list[str] = []
+
+        if not isinstance(teachers, list):
+            return ""
+
+        for teacher in teachers:
+            if not isinstance(teacher, dict):
+                continue
+
+            name = (
+                teacher.get("abbreviation")
+                or f"{teacher.get('firstname', '')} "
+                f"{teacher.get('lastname', '')}".strip()
+            )
+
+            if name:
+                names.append(str(name))
+
+        return ", ".join(names)
+
+    @classmethod
+    def _lesson_details(
+        cls,
+        lesson: dict[str, Any],
+    ) -> tuple[str, str, str]:
+        """Return subject, room and teacher for a lesson."""
+        actual = lesson.get("actualLesson") or lesson
+
+        subject_data = actual.get("subject") or {}
+        room_data = actual.get("room") or {}
+
+        if isinstance(subject_data, dict):
+            subject = (
+                subject_data.get("abbreviation")
+                or subject_data.get("shortName")
+                or subject_data.get("name")
+                or ""
+            )
+        else:
+            subject = str(subject_data or "")
+
+        if isinstance(room_data, dict):
+            room = (
+                room_data.get("name")
+                or room_data.get("shortName")
+                or room_data.get("abbreviation")
+                or ""
+            )
+        else:
+            room = str(room_data or "")
+
+        teacher = cls._teacher_text(actual)
+
+        # Compatibility with the flattened lesson format.
+        if not teacher:
+            teacher = str(actual.get("teacher") or lesson.get("teacher") or "")
+
+        if not room:
+            room = str(actual.get("room_name") or lesson.get("room") or "")
+
+        return str(subject), str(room), str(teacher)
+
+    @classmethod
+    def _original_details(
+        cls,
+        lesson: dict[str, Any],
+    ) -> tuple[str, str, str]:
+        """Return subject, room and teacher of the original lesson."""
+        # New API format.
+        original_lessons = lesson.get("originalLessons") or []
+        if isinstance(original_lessons, list) and original_lessons:
+            original = original_lessons[0]
+            if isinstance(original, dict):
+                return cls._lesson_details(original)
+
+        original_lesson = lesson.get("originalLesson")
+        if isinstance(original_lesson, dict):
+            return cls._lesson_details(original_lesson)
+
+        # Flattened format used by the supplied example.
+        original = lesson.get("original")
+        if isinstance(original, dict):
+            return (
+                str(original.get("subject") or ""),
+                str(original.get("room") or ""),
+                str(original.get("teacher") or ""),
+            )
+
+        return "", "", ""
+
+    @classmethod
+    def _subject_label(cls, lesson: dict[str, Any]) -> str:
+        """Return a multiline subject, room and teacher cell."""
+        lesson_type = lesson.get("type", "regularLesson")
+
+        subject, room, teacher = cls._lesson_details(lesson)
+
+        if lesson_type == "cancelledLesson":
+            subject, room, teacher = cls._original_details(lesson)
+            subject = f"{subject or '?'} ✗"
+
+        elif lesson_type in ("substitution", "teacherChange"):
+            subject = f"{subject} ↔" if subject else "↔"
+
+        elif not subject and lesson_type not in ("regularLesson", ""):
+            subject = LESSON_TYPE_LABELS.get(lesson_type, lesson_type)
+
+        # Format expected by stundenplan-card:
+        #
+        # Fach
+        # Raum
+        # Lehrer
+        return "\n".join(
+            value
+            for value in (subject, room, teacher)
+            if value
+        )
+
+    @classmethod
+    def _combine_subject_labels(
+        cls,
+        lessons: list[dict[str, Any]],
+    ) -> str:
+        """Combine multiple lessons in one cell."""
+        if not lessons:
+            return ""
+
+        if len(lessons) == 1:
+            return cls._subject_label(lessons[0])
+
+        cancelled = [
+            lesson
+            for lesson in lessons
+            if lesson.get("type") == "cancelledLesson"
+        ]
+        others = [
+            lesson
+            for lesson in lessons
+            if lesson.get("type") != "cancelledLesson"
+        ]
+
+        labels = [
+            cls._subject_label(lesson)
+            for lesson in (*cancelled, *others)
+        ]
+
+        unique_labels = list(
+            dict.fromkeys(label for label in labels if label)
+        )
+
+        # Empty line separates multiple lesson blocks in the card.
+        return "\n\n".join(unique_labels)
