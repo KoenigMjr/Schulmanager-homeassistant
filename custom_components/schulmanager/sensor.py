@@ -1994,11 +1994,11 @@ class WochenplanJsonDetailsSensor(WochenplanJsonSensor):
         # Format expected by stundenplan-card:
         #
         # Fach
-        # Raum
         # Lehrer
+        # Raum
         return "\n".join(
             value
-            for value in (subject, room, teacher)
+            for value in (subject, teacher, room)
             if value
         )
 
