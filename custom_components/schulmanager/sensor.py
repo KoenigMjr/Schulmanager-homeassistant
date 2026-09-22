@@ -1804,7 +1804,96 @@ class WochenplanJsonSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEnt
         return plan
 
     @staticmethod
-    def _subject_label(lesson: dict[str, Any]) -> str:
+    def _lesson_has_room_change(lesson: dict[str, Any]) -> bool:
+        """Return whether the lesson has a changed room."""
+        if lesson.get("type") == "roomChange":
+            return True
+
+        actual = lesson.get("actualLesson") or {}
+        original_lessons = lesson.get("originalLessons") or []
+
+        if not isinstance(actual, dict):
+            return False
+        if not isinstance(original_lessons, list) or not original_lessons:
+            return False
+
+        original = original_lessons[0]
+        if not isinstance(original, dict):
+            return False
+
+        actual_room = actual.get("room") or {}
+        original_room = original.get("room") or {}
+
+        if not isinstance(actual_room, dict):
+            return False
+        if not isinstance(original_room, dict):
+            return False
+
+        actual_name = (
+            actual_room.get("name")
+            or actual_room.get("shortName")
+            or actual_room.get("abbreviation")
+            or ""
+        )
+        original_name = (
+            original_room.get("name")
+            or original_room.get("shortName")
+            or original_room.get("abbreviation")
+            or ""
+        )
+
+        return bool(
+            actual_name
+            and original_name
+            and str(actual_name).strip() != str(original_name).strip()
+        )
+
+    @staticmethod
+    def _lesson_has_teacher_change(lesson: dict[str, Any]) -> bool:
+        """Return whether the lesson has a changed teacher."""
+        lesson_type = lesson.get("type")
+
+        if lesson_type in ("substitution", "teacherChange"):
+            return True
+
+        actual = lesson.get("actualLesson") or {}
+        original_lessons = lesson.get("originalLessons") or []
+
+        if not isinstance(actual, dict):
+            return False
+        if not isinstance(original_lessons, list) or not original_lessons:
+            return False
+
+        original = original_lessons[0]
+        if not isinstance(original, dict):
+            return False
+
+        actual_teachers = actual.get("teachers") or []
+        original_teachers = original.get("teachers") or []
+
+        def teacher_names(value: Any) -> list[str]:
+            if not isinstance(value, list):
+                return []
+
+            result: list[str] = []
+            for teacher in value:
+                if not isinstance(teacher, dict):
+                    continue
+
+                name = (
+                    teacher.get("abbreviation")
+                    or f"{teacher.get('firstname', '')} "
+                    f"{teacher.get('lastname', '')}".strip()
+                )
+                if name:
+                    result.append(str(name).strip())
+
+            return result
+
+        return teacher_names(actual_teachers) != teacher_names(original_teachers)
+
+    @classmethod
+    def _subject_label(cls, lesson: dict[str, Any]) -> str:
         """Return a human-readable label for a lesson cell."""
         lesson_type = lesson.get("type", "regularLesson")
         actual = lesson.get("actualLesson") or {}
@@ -1812,15 +1901,36 @@ class WochenplanJsonSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEnt
 
         if lesson_type == "cancelledLesson":
             orig_lessons = lesson.get("originalLessons") or []
-            orig_abbr = (orig_lessons[0].get("subject") or {}).get("abbreviation", "?") if orig_lessons else "?"
-            return f"{orig_abbr} ✗"
+            orig_abbr = (
+                (orig_lessons[0].get("subject") or {}).get(
+                    "abbreviation",
+                    "?",
+                )
+                if orig_lessons
+                else "?"
+            )
+            return f"{orig_abbr} ❌"
 
-        if lesson_type in ("substitution", "teacherChange"):
-            return f"{subject_abbr} ↔" if subject_abbr else "↔"
+        if lesson_type == "exam":
+            return f"{subject_abbr} 📝" if subject_abbr else "📝"
+
+        markers: list[str] = []
+
+        if cls._lesson_has_teacher_change(lesson):
+            markers.append("🔁")
+
+        if cls._lesson_has_room_change(lesson):
+            markers.append("🚪")
+
+        if markers:
+            marker_text = " ".join(markers)
+            return (
+                f"{subject_abbr} {marker_text}"
+                if subject_abbr
+                else marker_text
+            )
 
         if not subject_abbr and lesson_type not in ("regularLesson", ""):
-            # e.g. type "event" typically has no actualLesson.subject - fall
-            # back to the known German type label instead of an empty cell.
             return LESSON_TYPE_LABELS.get(lesson_type, lesson_type)
 
         return subject_abbr
@@ -1974,28 +2084,80 @@ class WochenplanJsonDetailsSensor(WochenplanJsonSensor):
 
         return "", "", ""
 
+    @staticmethod
+    def _has_room_change(lesson: dict[str, Any]) -> bool:
+        """Return whether the room changed."""
+        if lesson.get("type") == "roomChange":
+            return True
+
+        actual = lesson.get("actualLesson") or {}
+        original_lessons = lesson.get("originalLessons") or []
+
+        if not isinstance(actual, dict):
+            return False
+
+        if not isinstance(original_lessons, list) or not original_lessons:
+            return False
+
+        original = original_lessons[0]
+        if not isinstance(original, dict):
+            return False
+
+        actual_room = actual.get("room") or {}
+        original_room = original.get("room") or {}
+
+        if not isinstance(actual_room, dict):
+            return False
+
+        if not isinstance(original_room, dict):
+            return False
+
+        actual_name = (
+            actual_room.get("name")
+            or actual_room.get("shortName")
+            or actual_room.get("abbreviation")
+            or ""
+        )
+
+        original_name = (
+            original_room.get("name")
+            or original_room.get("shortName")
+            or original_room.get("abbreviation")
+            or ""
+        )
+
+        return bool(
+            actual_name
+            and original_name
+            and str(actual_name).strip()
+            != str(original_name).strip()
+        )
+
     @classmethod
     def _subject_label(cls, lesson: dict[str, Any]) -> str:
-        """Return a multiline subject, room and teacher cell."""
+        """Return subject, teacher and room with change markers."""
         lesson_type = lesson.get("type", "regularLesson")
 
         subject, room, teacher = cls._lesson_details(lesson)
 
         if lesson_type == "cancelledLesson":
             subject, room, teacher = cls._original_details(lesson)
-            subject = f"{subject or '?'} ✗"
+            subject = f"{subject or '?'} ❌"
 
-        elif lesson_type in ("substitution", "teacherChange"):
-            subject = f"{subject} ↔" if subject else "↔"
+        elif lesson_type == "exam":
+            subject = f"{subject} 📝" if subject else "📝"
 
-        elif not subject and lesson_type not in ("regularLesson", ""):
+        # Marker direkt an der betroffenen Information anzeigen.
+        if teacher and cls._has_teacher_change(lesson):
+            teacher = f"{teacher} 🔁"
+
+        if room and cls._has_room_change(lesson):
+            room = f"{room} 🚪"
+
+        # Fallback für andere nicht-reguläre Unterrichtstypen
+        if not subject and lesson_type not in ("regularLesson", ""):
             subject = LESSON_TYPE_LABELS.get(lesson_type, lesson_type)
 
-        # Format expected by stundenplan-card:
-        #
-        # Fach
-        # Lehrer
-        # Raum
         return "\n".join(
             value
             for value in (subject, teacher, room)
