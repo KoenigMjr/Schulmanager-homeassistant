@@ -1813,10 +1813,16 @@ class WochenplanJsonSensor(CoordinatorEntity[SchulmanagerCoordinator], SensorEnt
         if lesson_type == "cancelledLesson":
             orig_lessons = lesson.get("originalLessons") or []
             orig_abbr = (orig_lessons[0].get("subject") or {}).get("abbreviation", "?") if orig_lessons else "?"
-            return f"{orig_abbr} ✗"
+            return f"{orig_abbr} ❌"
 
-        if lesson_type in ("substitution", "teacherChange"):
-            return f"{subject_abbr} ↔" if subject_abbr else "↔"
+        if lesson_type in ("substitution", "teacherChange", "specialLesson", "irregularLesson"):
+            return f"{subject_abbr} 🔁" if subject_abbr else "🔁"
+
+        if lesson_type == "roomChange":
+            return f"{subject_abbr} 🚪" if subject_abbr else "🚪"
+
+        if lesson_type == "exam":
+            return f"{subject_abbr} 📝" if subject_abbr else "📝"
 
         if not subject_abbr and lesson_type not in ("regularLesson", ""):
             # e.g. type "event" typically has no actualLesson.subject - fall
@@ -1983,10 +1989,16 @@ class WochenplanJsonDetailsSensor(WochenplanJsonSensor):
 
         if lesson_type == "cancelledLesson":
             subject, room, teacher = cls._original_details(lesson)
-            subject = f"{subject or '?'} ✗"
+            subject = f"{subject or '?'} ❌"
 
-        elif lesson_type in ("substitution", "teacherChange"):
-            subject = f"{subject} ↔" if subject else "↔"
+        elif lesson_type in ("substitution", "teacherChange", "specialLesson", "irregularLesson"):
+            subject = f"{subject} 🔁" if subject else "🔁"
+
+        elif lesson_type == "roomChange":
+            subject = f"{subject} 🚪" if subject else "🚪"
+
+        elif lesson_type == "exam":
+            subject = f"{subject} 📝" if subject else "📝"
 
         elif not subject and lesson_type not in ("regularLesson", ""):
             subject = LESSON_TYPE_LABELS.get(lesson_type, lesson_type)
