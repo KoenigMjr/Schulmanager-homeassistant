@@ -2084,55 +2084,6 @@ class WochenplanJsonDetailsSensor(WochenplanJsonSensor):
 
         return "", "", ""
 
-    @staticmethod
-    def _has_room_change(lesson: dict[str, Any]) -> bool:
-        """Return whether the room changed."""
-        if lesson.get("type") == "roomChange":
-            return True
-
-        actual = lesson.get("actualLesson") or {}
-        original_lessons = lesson.get("originalLessons") or []
-
-        if not isinstance(actual, dict):
-            return False
-
-        if not isinstance(original_lessons, list) or not original_lessons:
-            return False
-
-        original = original_lessons[0]
-        if not isinstance(original, dict):
-            return False
-
-        actual_room = actual.get("room") or {}
-        original_room = original.get("room") or {}
-
-        if not isinstance(actual_room, dict):
-            return False
-
-        if not isinstance(original_room, dict):
-            return False
-
-        actual_name = (
-            actual_room.get("name")
-            or actual_room.get("shortName")
-            or actual_room.get("abbreviation")
-            or ""
-        )
-
-        original_name = (
-            original_room.get("name")
-            or original_room.get("shortName")
-            or original_room.get("abbreviation")
-            or ""
-        )
-
-        return bool(
-            actual_name
-            and original_name
-            and str(actual_name).strip()
-            != str(original_name).strip()
-        )
-
     @classmethod
     def _subject_label(cls, lesson: dict[str, Any]) -> str:
         """Return subject, teacher and room with change markers."""
@@ -2147,12 +2098,24 @@ class WochenplanJsonDetailsSensor(WochenplanJsonSensor):
         elif lesson_type == "exam":
             subject = f"{subject} 📝" if subject else "📝"
 
-        # Marker direkt an der betroffenen Information anzeigen.
-        if teacher and cls._has_teacher_change(lesson):
-            teacher = f"{teacher} 🔁"
+        else:
+            # Marker direkt an der betroffenen Information anzeigen,
+            # inkl. der ursprünglichen Angabe in Klammern.
+            if teacher and cls._lesson_has_teacher_change(lesson):
+                _, _, original_teacher = cls._original_details(lesson)
+                teacher = (
+                    f"{teacher} ({original_teacher}) 🔁"
+                    if original_teacher and original_teacher != teacher
+                    else f"{teacher} 🔁"
+                )
 
-        if room and cls._has_room_change(lesson):
-            room = f"{room} 🚪"
+            if room and cls._lesson_has_room_change(lesson):
+                _, original_room, _ = cls._original_details(lesson)
+                room = (
+                    f"{room} ({original_room}) 🚪"
+                    if original_room and original_room != room
+                    else f"{room} 🚪"
+                )
 
         # Fallback für andere nicht-reguläre Unterrichtstypen
         if not subject and lesson_type not in ("regularLesson", ""):
